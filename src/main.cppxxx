@@ -1,0 +1,553 @@
+
+#include <WiFi.h>
+#include <WiFiAP.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+#include "esp_system.h"  // For hardware reset
+
+// Configuration structure
+struct WiFiConfig {
+  String ssid;
+  String password;
+  bool isValid() const {
+    return ssid.length() > 0 && password.length() > 0;
+  }
+};
+
+// Global variables
+WiFiConfig currentConfig;
+AsyncWebServer* server = nullptr;
+AsyncWebServer* mainServer = nullptr;  // New: separate server for main app
+DNSServer* dnsServer = nullptr;
+Preferences preferences;
+bool configMode = false;
+bool resetRequested = false;
+unsigned long resetTime = 0;
+
+const char* AP_SSID = "ESP32-Setup-Testing";
+const char* AP_PASSWORD = "setup123";
+
+// HTML configuration page
+const char* configPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 WiFi Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f0f0f0; }
+        .container { background: white; padding: 30px; border-radius: 10px; max-width: 400px; margin: 0 auto; }
+        h1 { color: #333; text-align: center; }
+        input { width: 100%; padding: 12px; margin: 8px 0; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+        button { width: 100%; padding: 15px; background: #4CAF50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
+        button:hover { background: #45a049; }
+        .info { background: #e7f3ff; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>It works!</h1>
+        <h1>WiFi Config</h1>
+        <div class="info">
+            <strong>Connection Instructions:</strong><br>
+            1. Fill out the form below<br>
+            2. Click Save to connect
+        </div>
+        <form action="/save" method="POST">
+            <label>WiFi Network Name (SSID):</label>
+            <input type="text" name="ssid" placeholder="Enter WiFi network name" required>
+
+            <label>WiFi Password:</label>
+            <input type="password" name="password" placeholder="Enter WiFi password" required>
+
+            <button type="submit">Save & Connect</button>
+        </form>
+    </div>
+</body>
+</html>
+)";
+
+// Reset confirmation page
+const char* resetPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Reset WiFi</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f0f0f0; }
+        .container { background: white; padding: 30px; border-radius: 10px; max-width: 400px; margin: 0 auto; }
+        h1 { color: #333; text-align: center; }
+        .warning { background: #fff3cd; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 4px solid #ffc107; }
+        .button { display: inline-block; padding: 15px 20px; margin: 10px; text-decoration: none; border-radius: 5px; font-size: 16px; text-align: center; cursor: pointer; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-secondary:hover { background: #5a6268; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Reset WiFi Configuration</h1>
+        <div class="warning">
+            <strong>Warning:</strong> This will erase the saved WiFi settings and restart the device in configuration mode.
+        </div>
+        <p>Current WiFi: <strong>%CURRENT_SSID%</strong></p>
+        <p>Device IP: <strong>%DEVICE_IP%</strong></p>
+        
+        <div style="text-align: center;">
+            <form action="/reset/confirm" method="POST" style="display: inline;">
+                <button type="submit" class="button btn-danger">Yes, Reset WiFi</button>
+            </form>
+            <a href="/" class="button btn-secondary">Cancel</a>
+        </div>
+    </div>
+</body>
+</html>
+)";
+
+// Main app status page
+const char* statusPage = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Status</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 40px; background: #f0f0f0; }
+        .container { background: white; padding: 30px; border-radius: 10px; max-width: 400px; margin: 0 auto; }
+        h1 { color: #333; text-align: center; }
+        .status { background: #d4edda; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 4px solid #28a745; }
+        .info-row { margin: 10px 0; padding: 8px; background: #f8f9fa; border-radius: 3px; }
+        .label { font-weight: bold; color: #495057; }
+        .button { display: inline-block; padding: 12px 20px; margin: 10px 5px; text-decoration: none; border-radius: 5px; font-size: 14px; text-align: center; cursor: pointer; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-info { background: #17a2b8; color: white; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-info:hover { background: #138496; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32 Device Status</h1>
+        <div class="status">
+            <strong>✓ WiFi Connected</strong>
+        </div>
+        
+        <div class="info-row">
+            <span class="label">Network:</span> %CURRENT_SSID%
+        </div>
+        <div class="info-row">
+            <span class="label">IP Address:</span> %DEVICE_IP%
+        </div>
+        <div class="info-row">
+            <span class="label">MAC Address:</span> %MAC_ADDRESS%
+        </div>
+        <div class="info-row">
+            <span class="label">Signal Strength:</span> %RSSI% dBm
+        </div>
+        <div class="info-row">
+            <span class="label">Uptime:</span> %UPTIME%
+        </div>
+        
+        <div style="text-align: center; margin-top: 30px;">
+            <a href="/reset" class="button btn-danger">Reset WiFi Settings</a>
+            <a href="/" class="button btn-info">Refresh</a>
+        </div>
+    </div>
+</body>
+</html>
+)";
+
+// Function declarations
+void saveConfig(const WiFiConfig& config);
+void clearConfig();
+WiFiConfig loadConfig();
+void startConfigMode();
+void stopConfigMode();
+void startMainServer();
+void stopMainServer();
+bool connectToWiFi(const WiFiConfig& config);
+void handleRoot(AsyncWebServerRequest *request);
+void handleSave(AsyncWebServerRequest *request);
+void handleNotFound(AsyncWebServerRequest *request);
+void handleMainRoot(AsyncWebServerRequest *request);
+void handleReset(AsyncWebServerRequest *request);
+void handleResetConfirm(AsyncWebServerRequest *request);
+String formatUptime();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Give serial time to initialize
+  Serial.println("\n=== ESP32 WiFi Auto-Configuration ===");
+  Serial.println("Hello! ESP32 program started successfully.");
+  Serial.println("Program compiled: " + String(__DATE__) + " " + String(__TIME__));
+  Serial.println("1. Serial communication initialized");
+  
+  // Initialize preferences for storing WiFi config
+  Serial.println("2. Initializing preferences...");
+  preferences.begin("wifi-config", false);
+  Serial.println("3. Preferences initialized successfully");
+  
+  // Load saved configuration
+  Serial.println("4. Loading saved WiFi configuration...");
+  currentConfig = loadConfig();
+  Serial.println("5. Configuration loading complete");
+  
+  // Try to connect to saved WiFi first
+  if (currentConfig.isValid()) {
+    Serial.println("6. Found saved WiFi config, attempting to connect...");
+    if (connectToWiFi(currentConfig)) {
+      Serial.println("✓ Successfully connected to WiFi!");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      
+      // Initialize mDNS
+      Serial.println("7. Initializing mDNS...");
+      if (MDNS.begin("hw")) {
+        Serial.println("✓ mDNS responder started");
+        // Add HTTP service
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("✓ HTTP service advertised");
+        Serial.println("Access your ESP32 at: http://hw.esp32");
+      } else {
+        Serial.println("✗ Error setting up mDNS responder");
+      }
+      
+      Serial.println("8. Starting main application server...");
+      
+      // Start the main application server
+      startMainServer();
+      Serial.println("9. Setup complete - main app mode");
+      return; // Success! Exit setup and run main app
+    } else {
+      Serial.println("✗ Failed to connect to saved WiFi");
+    }
+  } else {
+    Serial.println("6. No valid WiFi config found");
+  }
+  
+  // If we reach here, either no config exists or connection failed
+  Serial.println("7. Starting configuration mode...");
+  startConfigMode();
+  Serial.println("8. Setup complete - configuration mode");
+}
+
+void loop() {
+  if (configMode) {
+    // Handle DNS requests for captive portal
+    if (dnsServer) {
+      dnsServer->processNextRequest();
+    }
+    delay(10);
+  } else {
+    // Check for pending reset request
+    if (resetRequested && millis() >= resetTime) {
+      Serial.println("Executing delayed WiFi reset...");
+      
+      // Stop the main server first
+      stopMainServer();
+      
+      // Clear the stored configuration
+      clearConfig();
+      
+      Serial.println("Configuration cleared, restarting...");
+      Serial.flush(); // Ensure all serial output is sent
+      delay(500);
+      
+      // Use hardware reset instead of software reset
+      esp_restart(); // Hardware reset - more reliable than ESP.restart()
+    }
+    
+    // mDNS is handled automatically by the ESP32
+    
+    // Main application code goes here
+    static unsigned long lastStatus = 0;
+    if (millis() - lastStatus > 60000) { // Print status every minute
+      lastStatus = millis();
+      Serial.println("Main app running - WiFi connected!");
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
+      Serial.println("mDNS: http://hw.esp32");
+    }
+    
+    // Check WiFi connection every 30 seconds
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck > 30000) {
+      lastCheck = millis();
+      
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi connection lost! Restarting...");
+        esp_restart(); // This will trigger the whole setup process again
+      }
+    }
+    
+    delay(1000);
+  }
+}
+
+WiFiConfig loadConfig() {
+  WiFiConfig config;
+  config.ssid = preferences.getString("ssid", "");
+  config.password = preferences.getString("password", "");
+  
+  if (config.isValid()) {
+    Serial.println("Loaded WiFi config from memory");
+  }
+  
+  return config;
+}
+
+void saveConfig(const WiFiConfig& config) {
+  preferences.putString("ssid", config.ssid);
+  preferences.putString("password", config.password);
+  Serial.println("WiFi config saved to memory");
+}
+
+void clearConfig() {
+  preferences.remove("ssid");
+  preferences.remove("password");
+  Serial.println("WiFi config cleared from memory");
+}
+
+bool connectToWiFi(const WiFiConfig& config) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(config.ssid.c_str(), config.password.c_str());
+  
+  Serial.print("Connecting to ");
+  Serial.print(config.ssid);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+  
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void startMainServer() {
+  mainServer = new AsyncWebServer(80);
+  
+  mainServer->on("/", HTTP_GET, handleMainRoot);
+  mainServer->on("/reset", HTTP_GET, handleReset);
+  mainServer->on("/reset/confirm", HTTP_POST, handleResetConfirm);
+  
+  mainServer->begin();
+  Serial.println("✓ Main application web server started");
+  Serial.println("Access http://" + WiFi.localIP().toString() + "/reset to reset WiFi settings");
+}
+
+void stopMainServer() {
+  if (mainServer) {
+    delete mainServer;
+    mainServer = nullptr;
+    Serial.println("Main application server stopped");
+  }
+}
+
+void startConfigMode() {
+  configMode = true;
+  
+  // Stop main server if running
+  stopMainServer();
+  
+  // Stop any existing WiFi connection
+  WiFi.disconnect(true);
+  delay(1000);
+  
+  // Start Access Point
+  WiFi.mode(WIFI_AP);
+  bool apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  
+  if (!apStarted) {
+    Serial.println("Failed to start Access Point!");
+    return;
+  }
+  
+  Serial.println("✓ Access Point started");
+  Serial.print("Network Name: ");
+  Serial.println(AP_SSID);
+  Serial.print("Password: ");
+  Serial.println(AP_PASSWORD);
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Start DNS server for captive portal
+  dnsServer = new DNSServer();
+  dnsServer->start(53, "*", WiFi.softAPIP());
+  
+  // Start web server
+  server = new AsyncWebServer(80);
+  
+  // Captive portal routes
+  server->on("/", HTTP_GET, handleRoot);
+  server->on("/config", HTTP_GET, handleRoot);
+  server->on("/save", HTTP_POST, handleSave);
+  
+  // Android captive portal detection
+  server->on("/generate_204", HTTP_GET, handleRoot);
+  // iOS captive portal detection  
+  server->on("/hotspot-detect.html", HTTP_GET, handleRoot);
+  // Windows captive portal detection
+  server->on("/connecttest.txt", HTTP_GET, handleRoot);
+  // Firefox captive portal detection
+  server->on("/canonical.html", HTTP_GET, handleRoot);
+  
+  server->onNotFound(handleNotFound);
+  
+  server->begin();
+  Serial.println("✓ Configuration web server started");
+  Serial.println("Connect to the WiFi network and you'll be redirected to setup page");
+}
+
+void stopConfigMode() {
+  configMode = false;
+  
+  if (server) {
+    delete server;
+    server = nullptr;
+  }
+  
+  if (dnsServer) {
+    dnsServer->stop();
+    delete dnsServer;
+    dnsServer = nullptr;
+  }
+  
+  WiFi.softAPdisconnect(true);
+  Serial.println("Configuration mode stopped");
+}
+
+void handleRoot(AsyncWebServerRequest *request) {
+  request->send(200, "text/html", configPage);
+}
+
+void handleSave(AsyncWebServerRequest *request) {
+  if (!request->hasParam("ssid", true) || !request->hasParam("password", true)) {
+    request->send(400, "text/plain", "Missing SSID or password");
+    return;
+  }
+  
+  WiFiConfig newConfig;
+  newConfig.ssid = request->getParam("ssid", true)->value();
+  newConfig.password = request->getParam("password", true)->value();
+  
+  Serial.println("Received new WiFi configuration:");
+  Serial.print("SSID: ");
+  Serial.println(newConfig.ssid);
+  
+  // Send response before stopping server
+  request->send(200, "text/html", 
+    "<html><body><h2>Connecting...</h2>"
+    "<p>ESP32 is now trying to connect to your WiFi network.</p>"
+    "<p>If successful, this setup page will no longer be available.</p>"
+    "<p>Check the serial monitor for connection status.</p></body></html>");
+  
+  // Save configuration
+  saveConfig(newConfig);
+  
+  // Stop configuration mode
+  stopConfigMode();
+  
+  // Try to connect to new WiFi
+  if (connectToWiFi(newConfig)) {
+    Serial.println("✓ Successfully connected to new WiFi!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    currentConfig = newConfig;
+    
+    // Initialize mDNS
+    Serial.println("Initializing mDNS...");
+    if (MDNS.begin("hw")) {
+      Serial.println("✓ mDNS responder started");
+      Serial.println("Access your ESP32 at: http://hw.esp32");
+    } else {
+      Serial.println("✗ Error setting up mDNS responder");
+    }
+    
+    // Start main server
+    startMainServer();
+  } else {
+    Serial.println("✗ Failed to connect to new WiFi, restarting...");
+    delay(2000);
+    esp_restart(); // Restart to try again
+  }
+}
+
+void handleNotFound(AsyncWebServerRequest *request) {
+  // Redirect all unknown requests to root for captive portal
+  request->redirect("/");
+}
+
+void handleMainRoot(AsyncWebServerRequest *request) {
+  String page = statusPage;
+  page.replace("%CURRENT_SSID%", currentConfig.ssid);
+  page.replace("%DEVICE_IP%", WiFi.localIP().toString());
+  page.replace("%MAC_ADDRESS%", WiFi.macAddress());
+  page.replace("%RSSI%", String(WiFi.RSSI()));
+  page.replace("%UPTIME%", formatUptime());
+  
+  request->send(200, "text/html", page);
+}
+
+void handleReset(AsyncWebServerRequest *request) {
+  String page = resetPage;
+  page.replace("%CURRENT_SSID%", currentConfig.ssid);
+  page.replace("%DEVICE_IP%", WiFi.localIP().toString());
+  
+  request->send(200, "text/html", page);
+}
+
+void handleResetConfirm(AsyncWebServerRequest *request) {
+  Serial.println("WiFi reset requested via web interface");
+  
+  request->send(200, "text/html", 
+    "<html><head><meta http-equiv='refresh' content='8;url=about:blank'></head>"
+    "<body style='font-family: Arial; text-align: center; padding: 50px;'>"
+    "<h2>🔄 Resetting WiFi Configuration...</h2>"
+    "<p>The device is clearing WiFi settings and restarting in configuration mode.</p>"
+    "<div style='background: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0;'>"
+    "<strong>Next Steps:</strong><br>"
+    "1. Wait for device restart (about 10 seconds)<br>"
+    "2. Look for WiFi network: <strong>" + String(AP_SSID) + "</strong><br>"
+    "3. Connect with password: <strong>" + String(AP_PASSWORD) + "</strong><br>"
+    "4. You'll be redirected to the setup page"
+    "</div>"
+    "<p><em>This page will close automatically...</em></p>"
+    "<script>"
+    "let countdown = 8;"
+    "function updateCountdown() {"
+    "  document.querySelector('h2').innerHTML = '🔄 Resetting... (' + countdown + 's)';"
+    "  countdown--;"
+    "  if (countdown < 0) window.close();"
+    "}"
+    "setInterval(updateCountdown, 1000);"
+    "</script></body></html>");
+  
+  // Set flag to handle reset in main loop
+  resetRequested = true;
+  resetTime = millis() + 3000; // 3 second delay
+}
+
+String formatUptime() {
+  unsigned long uptime = millis() / 1000;
+  unsigned long days = uptime / 86400;
+  uptime %= 86400;
+  unsigned long hours = uptime / 3600;
+  uptime %= 3600;
+  unsigned long minutes = uptime / 60;
+  unsigned long seconds = uptime % 60;
+  
+  String result = "";
+  if (days > 0) result += String(days) + "d ";
+  if (hours > 0) result += String(hours) + "h ";
+  if (minutes > 0) result += String(minutes) + "m ";
+  result += String(seconds) + "s";
+  
+  return result;
+}
