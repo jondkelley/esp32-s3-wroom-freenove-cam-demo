@@ -68,23 +68,36 @@ bool initCamera() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 10000000;  // Use Freenove's official frequency
-  config.frame_size = FRAMESIZE_SVGA;  // Use Freenove's official size
   config.pixel_format = PIXFORMAT_JPEG; // for streaming
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  // for larger pre-allocated frame buffer.
+  // High-resolution settings with PSRAM optimization
   if(psramFound()){
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
+    // FRAMESIZE_QQVGA    // 160x120   - Tiny
+    // FRAMESIZE_QCIF     // 176x144   - Very small  
+    // FRAMESIZE_HQVGA    // 240x176   - Small
+    // FRAMESIZE_QVGA     // 320x240   - Small
+    // FRAMESIZE_CIF      // 400x296   - Medium
+    // FRAMESIZE_HVGA     // 480x320   - Medium
+    // FRAMESIZE_VGA      // 640x480   - Standard
+    // FRAMESIZE_SVGA     // 800x600   - Current fallback
+    // FRAMESIZE_XGA      // 1024x768  - Current PSRAM setting
+    // FRAMESIZE_HD       // 1280x720  - HD (larger files!)
+    // FRAMESIZE_SXGA     // 1280x1024 - High (larger files!)
+    // FRAMESIZE_UXGA     // 1600x1200 - Ultra High (HUGE files!)
+    config.frame_size = FRAMESIZE_XGA;    // 1024x768 - MUCH higher than 800x600!
+    config.jpeg_quality = 6;              // Higher quality (was 10)
+    config.fb_count = 2;                  // Double buffering
     config.grab_mode = CAMERA_GRAB_LATEST;
+    Serial.println("🎯 PSRAM detected: Using HIGH RESOLUTION 1024x768, Quality 6");
   } else {
-    // Limit the frame size when PSRAM is not available
-    config.frame_size = FRAMESIZE_HVGA;
+    // Fallback for no PSRAM - still better than before
+    config.frame_size = FRAMESIZE_SVGA;   // 800x600 (was HVGA 480x320)
+    config.jpeg_quality = 8;              // Better quality
+    config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
+    Serial.println("⚠️ No PSRAM: Using STANDARD RESOLUTION 800x600, Quality 8");
   }
   
   Serial.printf("📍 Using ESP32S3_EYE model with camera_pins.h definitions\n");
@@ -319,6 +332,8 @@ void setup() {
         .latest-photo { max-width: 100%; height: auto; border: 3px solid #ddd; border-radius: 10px; }
         .gallery-link { display: inline-block; padding: 10px 20px; background: #2196F3; color: white; text-decoration: none; border-radius: 5px; margin: 10px; }
         .gallery-link:hover { background: #1976D2; }
+        .clear-btn { display: inline-block; padding: 10px 20px; background: #f44336; color: white; text-decoration: none; border-radius: 5px; margin: 10px; }
+        .clear-btn:hover { background: #d32f2f; }
     </style>
 </head>
 <body>
@@ -339,12 +354,14 @@ void setup() {
             <img src=")" + lastPhotoFilename + R"(" class="latest-photo" alt="Latest Photo"><br>)" : 
             R"(<p><strong>Status:</strong> No photos captured yet</p>)") + R"(
             <a href="/gallery" class="gallery-link">View Photo Gallery</a>
+            <br>
+            <a href="/clear-photos" class="clear-btn">Clear All Photos</a>
         </div>
         <div class="info">
             <h3>Camera Status</h3>
             <p><strong>Camera Module:</strong> )" + (cameraReady ? "Ready" : "Not Ready") + R"(</p>
-            <p><strong>Resolution:</strong> )" + (cameraReady ? "800x600 (SVGA)" : "Not Available") + R"(</p>
-            <p><strong>Quality:</strong> )" + (cameraReady ? "High (JPEG 12)" : "Not Available") + R"(</p>
+            <p><strong>Resolution:</strong> )" + (cameraReady ? (psramFound() ? "1024x768 (XGA)" : "800x600 (SVGA)") : "Not Available") + R"(</p>
+            <p><strong>Quality:</strong> )" + (cameraReady ? (psramFound() ? "High (JPEG 6)" : "Standard (JPEG 8)") : "Not Available") + R"(</p>
         </div>
         <div class="info">
             <h3>Storage Status</h3>
@@ -403,6 +420,7 @@ void setup() {
     <div class="container">
         <h1>Photo Gallery</h1>
         <a href="/" class="back-link">← Back to Main</a>
+        <a href="/clear-photos" class="back-link" style="background: #f44336;">Clear All Photos</a>
         <p><strong>Total Photos:</strong> )" + String(photoCount) + R"(</p>
         <div class="gallery">
 )";
@@ -461,6 +479,40 @@ void setup() {
     request->send(200, "text/html", html);
   });
 
+
+  // Route to clear all photos from SD card
+  server.on("/clear-photos", HTTP_GET, [](AsyncWebServerRequest *request){
+    int deletedCount = 0;
+    if (sdCardReady) {
+      File root = SD_MMC.open("/photos");
+      if (root) {
+        File file = root.openNextFile();
+        while (file) {
+          if (!file.isDirectory() && String(file.name()).endsWith(".jpg")) {
+            String fullPath = "/photos/" + String(file.name());
+            file.close();
+            if (SD_MMC.remove(fullPath)) {
+              deletedCount++;
+            }
+            file = root.openNextFile();
+          } else {
+            file = root.openNextFile();
+          }
+        }
+        root.close();
+        // Reset photo counter
+        photoCount = 0;
+        lastPhotoFilename = "";
+      }
+    }
+    
+    String message = "Cleared " + String(deletedCount) + " photos from SD card. Redirecting...";
+    String html = "<html><head><meta http-equiv='refresh' content='2;url=/'></head><body>";
+    html += "<h2>Photos Cleared!</h2><p>" + message + "</p></body></html>";
+    
+    Serial.printf("🗑️ User cleared %d photos from SD card\n", deletedCount);
+    request->send(200, "text/html", html);
+  });
 
   server.begin();
   Serial.println("✅ Web server started successfully!");
